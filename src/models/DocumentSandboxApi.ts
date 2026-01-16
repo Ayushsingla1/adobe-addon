@@ -52,4 +52,6 @@ export interface PresentationInput {
 // Document Sandbox API interface
 export interface DocumentSandboxApi {
     generatePresentation(input: PresentationInput): Promise<void>;
+    getPageCount(): Promise<number>;
+    goToPage(index: number): Promise<void>;
 }

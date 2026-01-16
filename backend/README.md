@@ -27,6 +27,13 @@ Create a `.env` file in the backend directory:
 # Get your API key from: https://makersuite.google.com/app/apikey
 GOOGLE_API_KEY=your_google_api_key_here
 
+# ElevenLabs API Key for Text-to-Speech
+# Get your API key from: https://elevenlabs.io
+ELEVENLABS_API_KEY=your_elevenlabs_api_key_here
+
+# Default model and voice IDs (can be overridden in the UI)
+ELEVENLABS_MODEL_ID=replace-with-elevenlabs-model-id
+
 # Server Configuration (optional)
 PORT=8000
 ```
@@ -62,6 +69,28 @@ uvicorn server:app --reload --port 8000
   ```json
   {
     "url": "https://example.com/blog-post"
+  }
+  ```
+
+### Generate Narration (Gemini + ElevenLabs TTS)
+- `POST /api/generate-narration`
+  ```json
+  {
+    "slides": [
+      {
+        "type": "content",
+        "title": "Slide Title",
+        "content": "Slide content text"
+      }
+    ],
+    "options": {
+      "voice": "replace-with-elevenlabs-voice-id",
+      "audio_format": "mp3",
+      "target_words": 90,
+      "transition_ms": 400,
+      "model": "gemini-2.5-flash",
+      "model_id": "replace-with-elevenlabs-model-id"
+    }
   }
   ```
 

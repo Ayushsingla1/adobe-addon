@@ -28,6 +28,7 @@ class WorkflowState(TypedDict):
     refined_content: str
     presentation_slides: List[dict]
     error: Optional[str]
+    desired_slide_count: Optional[int]
 
 
 def detect_url_type(state: WorkflowState) -> WorkflowState:
@@ -197,8 +198,12 @@ def refine_content(state: WorkflowState) -> WorkflowState:
         )
         
         # Truncate content if too long (Gemini has context limits)
-        content = state["raw_content"][:50000]  # Keep first 50k chars
+        content = state["raw_content"][:50000]
         
+        desired_total = state.get("desired_slide_count")
+        desired_content = max(desired_total - 2, 0) if desired_total else None
+        key_point_hint = f"{desired_content}" if desired_content else "5-8"
+
         prompt = f"""You are an expert content analyzer and summarizer. 
 Given the following content from a {'YouTube video transcript' if state['url_type'] == 'youtube' else 'blog/website'}, 
 create a refined, well-structured summary that captures the key points and main ideas.
@@ -211,7 +216,7 @@ Content:
 Please provide:
 1. A refined, engaging title for a presentation
 2. A concise executive summary (2-3 sentences)
-3. 5-8 key points or sections that would make good presentation slides
+3. {key_point_hint} key points or sections that would make good presentation slides
 4. For each key point, provide a brief explanation (1-2 sentences)
 
 Format your response as JSON with this structure:
@@ -266,10 +271,15 @@ def generate_presentation(state: WorkflowState) -> WorkflowState:
         }]
         return state
     
+    desired_total = state.get("desired_slide_count")
+    if desired_total is not None:
+        desired_total = max(2, desired_total)
+    desired_content = max(desired_total - 2, 0) if desired_total else None
+
     try:
         # Try to parse refined content as JSON
         refined_data = json.loads(state["refined_content"])
-        
+
         slides = []
         
         # Title slide
@@ -281,6 +291,8 @@ def generate_presentation(state: WorkflowState) -> WorkflowState:
         
         # Content slides from key points
         key_points = refined_data.get("key_points", [])
+        if desired_content is not None:
+            key_points = key_points[:desired_content]
         for i, point in enumerate(key_points):
             slides.append({
                 "type": "content",
@@ -318,7 +330,10 @@ def generate_presentation(state: WorkflowState) -> WorkflowState:
         if current_chunk:
             chunks.append(current_chunk.strip())
         
-        chunks = chunks[:10]
+        if desired_content is not None:
+            chunks = chunks[:desired_content]
+        else:
+            chunks = chunks[:10]
         
         slides = [{
             "type": "title",
@@ -400,7 +415,7 @@ def create_workflow():
 presentation_workflow = create_workflow()
 
 
-async def process_url(url: str) -> dict:
+async def process_url(url: str, desired_slide_count: Optional[int] = None) -> dict:
     """
     Main entry point for processing a URL through the workflow.
     
@@ -417,7 +432,8 @@ async def process_url(url: str) -> dict:
         "title": "",
         "refined_content": "",
         "presentation_slides": [],
-        "error": None
+        "error": None,
+        "desired_slide_count": desired_slide_count
     }
     
     # Run the workflow
