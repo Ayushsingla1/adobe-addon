@@ -162,6 +162,50 @@ const staggerChildren = {
     }
 };
 
+// Helper to extract dominant color from image
+const extractDominantColor = (imageSrc: string): Promise<{ r: number, g: number, b: number } | null> => {
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.crossOrigin = "Anonymous";
+        img.src = imageSrc;
+        img.onload = () => {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            if (!ctx) { resolve(null); return; }
+            
+            canvas.width = img.width;
+            canvas.height = img.height;
+            ctx.drawImage(img, 0, 0);
+            
+            // Sample center pixels for better accuracy than 0,0
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const data = imageData.data;
+            let r = 0, g = 0, b = 0, count = 0;
+            
+            // Simple average of every 10th pixel to performance
+            for (let i = 0; i < data.length; i += 40) {
+                if (data[i + 3] > 128) { // Ignore transparent pixels
+                    r += data[i];
+                    g += data[i + 1];
+                    b += data[i + 2];
+                    count++;
+                }
+            }
+            
+            if (count > 0) {
+                resolve({
+                    r: Math.round(r / count),
+                    g: Math.round(g / count),
+                    b: Math.round(b / count)
+                });
+            } else {
+                resolve(null);
+            }
+        };
+        img.onerror = () => resolve(null);
+    });
+};
+
 addOnUISdk.ready.then(async () => {
     const { runtime } = addOnUISdk.instance;
     const sandboxProxy: any = await runtime.apiProxy(RuntimeType.documentSandbox);
@@ -173,6 +217,10 @@ addOnUISdk.ready.then(async () => {
         const [error, setError] = useState("");
         const [presentationData, setPresentationData] = useState<PresentationResponse | null>(null);
         const [presentationStartIndex, setPresentationStartIndex] = useState<number | null>(null);
+        
+        // Brand Identity
+        const [brandLogo, setBrandLogo] = useState<string | null>(null); // Base64 string
+        const [brandColor, setBrandColor] = useState<{ r: number, g: number, b: number } | null>(null);
         
         // Customization options
         const [selectedTemplate, setSelectedTemplate] = useState<keyof typeof TEMPLATES>("modern");
@@ -192,11 +240,105 @@ addOnUISdk.ready.then(async () => {
         const [transitionMs, setTransitionMs] = useState(400);
         const [isPlayingNarration, setIsPlayingNarration] = useState(false);
         const [currentNarrationIndex, setCurrentNarrationIndex] = useState<number | null>(null);
+        const [isVideoExporting, setIsVideoExporting] = useState(false);
+        const [videoUrl, setVideoUrl] = useState<string | null>(null);
         const stopPlaybackRef = useRef(false);
         
         // Active section
         const [activeSection, setActiveSection] = useState<'main' | 'narration'>('main');
         
+        const handleExportVideo = async () => {
+            if (!narrationData || !presentationData) return;
+            setIsVideoExporting(true);
+            setNarrationError("");
+            setVideoUrl(null);
+            setStatus("Capturing slides...");
+            
+            try {
+                let slideImages: string[] = [];
+                
+                // Try to export all pages as PNG images using Adobe Express API
+                try {
+                    const renditionOptions = {
+                        range: addOnUISdk.constants.Range.entireDocument,
+                        format: addOnUISdk.constants.RenditionFormat.png,
+                    };
+                    
+                    const renditions = await addOnUISdk.app.document.createRenditions(
+                        renditionOptions,
+                        addOnUISdk.constants.RenditionIntent.export
+                    );
+                    
+                    // Convert blobs to base64
+                    setStatus("Processing images...");
+                    
+                    for (const rendition of renditions) {
+                        const blob = rendition.blob;
+                        const base64 = await new Promise<string>((resolve) => {
+                            const reader = new FileReader();
+                            reader.onloadend = () => resolve(reader.result as string);
+                            reader.readAsDataURL(blob);
+                        });
+                        slideImages.push(base64);
+                    }
+                } catch (renditionErr) {
+                    console.warn("Could not capture slides, using fallback rendering:", renditionErr);
+                    // slideImages will remain empty, backend will generate images
+                }
+                
+                // Collect audio file names from narration data
+                const audioFiles = narrationData.slides.map(s => s.audio_url);
+                
+                setStatus("Generating video...");
+                const response = await fetch(`${API_BASE_URL}/api/export-video`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        slides: presentationData.slides,
+                        slide_images: slideImages.length > 0 ? slideImages : null,
+                        audio_files: audioFiles,
+                        template_settings: {
+                            colors: TEMPLATES[selectedTemplate].colors,
+                            template: selectedTemplate
+                        }
+                    })
+                });
+                
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.detail || "Video export failed");
+                }
+                const data = await response.json();
+                setVideoUrl(`${API_BASE_URL}${data.video_url}`);
+                setStatus("");
+                
+            } catch (err: any) {
+                console.error(err);
+                setNarrationError("Failed to export video: " + err.message);
+                setStatus("");
+            } finally {
+                setIsVideoExporting(false);
+            }
+        };
+
+        const handleLogoUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+            const file = event.target.files?.[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                const result = e.target?.result as string;
+                if (result) {
+                    setBrandLogo(result); // Base64 string
+                    const color = await extractDominantColor(result);
+                    if (color) {
+                        setBrandColor(color);
+                    }
+                }
+            };
+            reader.readAsDataURL(file);
+        };
+
         // Process URL through the backend workflow
         const handleProcessUrl = async () => {
             if (!url.trim()) {
@@ -257,9 +399,17 @@ addOnUISdk.ready.then(async () => {
             }
             
             setIsProcessing(true);
-            setStatus("Creating slides...");
+            setStatus("Preparing document...");
             
             try {
+                // Clear existing pages/content before generating new presentation
+                try {
+                    await sandboxProxy.clearDocument();
+                } catch (clearErr) {
+                    console.warn("Could not clear document, proceeding with generation:", clearErr);
+                }
+                
+                setStatus("Creating slides...");
                 const template = TEMPLATES[selectedTemplate];
                 const size = SLIDE_SIZES[selectedSize];
                 const fontSize = FONT_SIZES[selectedFontSize];
@@ -274,6 +424,13 @@ addOnUISdk.ready.then(async () => {
                         fontSizes: fontSize,
                         layoutStyle: layoutStyle,
                         fontStyle: selectedFont,
+                        brandLogo: brandLogo,
+                        brandColor: brandColor ? { 
+                            red: brandColor.r / 255, 
+                            green: brandColor.g / 255, 
+                            blue: brandColor.b / 255, 
+                            alpha: 1 
+                        } : undefined,
                     }
                 });
 
@@ -525,33 +682,33 @@ addOnUISdk.ready.then(async () => {
                 </motion.div>
                 
                 {/* Settings Toggle */}
-                <div style={styles.settingGroup}>
-    <label style={styles.settingLabel}>Layout Style</label>
-    <div style={{ display: 'flex', gap: '8px' }}>
-        {['mixed', 'card', 'split', 'classic'].map((style) => (
-            <motion.button
-                key={style}
-                onClick={() => setLayoutStyle(style as any)}
-                style={{
-                    flex: 1,
-                    padding: '8px',
-                    fontSize: '11px',
-                    fontWeight: 600,
-                    borderRadius: '8px',
-                    border: 'none',
-                    cursor: 'pointer',
-                    textTransform: 'capitalize',
-                    backgroundColor: layoutStyle === style ? '#6366f1' : '#f1f5f9',
-                    color: layoutStyle === style ? 'white' : '#64748b',
-                }}
-                whileHover={{ scale: 1.05 }}
-                whileTap={{ scale: 0.95 }}
-            >
-                {style}
-            </motion.button>
-        ))}
-    </div>
-</div>
+                <motion.div 
+                    style={styles.settingsToggle}
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    transition={{ delay: 0.2 }}
+                >
+                    <motion.button
+                        onClick={() => setShowSettings(!showSettings)}
+                        style={styles.settingsButton}
+                        whileHover={{ backgroundColor: '#f8fafc' }}
+                        whileTap={{ scale: 0.98 }}
+                    >
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none">
+                            <circle cx="12" cy="12" r="3" stroke="#64748b" strokeWidth="2"/>
+                            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" stroke="#64748b" strokeWidth="2"/>
+                        </svg>
+                        <span>Customize</span>
+                        <motion.span
+                            animate={{ rotate: showSettings ? 180 : 0 }}
+                            transition={{ duration: 0.3 }}
+                        >
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+                                <path d="M6 9l6 6 6-6" stroke="#64748b" strokeWidth="2" strokeLinecap="round"/>
+                            </svg>
+                        </motion.span>
+                    </motion.button>
+                </motion.div>
                 
                 {/* Settings Panel */}
                 <AnimatePresence>
@@ -563,6 +720,47 @@ addOnUISdk.ready.then(async () => {
                             exit={{ opacity: 0, height: 0 }}
                             transition={{ duration: 0.3 }}
                         >
+                            {/* Brand Identity */}
+                            <div style={styles.settingGroup}>
+                                <label style={styles.settingLabel}>Brand Identity</label>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                                    <div style={{ position: 'relative', width: '40px', height: '40px' }}>
+                                        {brandLogo ? (
+                                            <img src={brandLogo} style={{ width: '100%', height: '100%', borderRadius: '8px', objectFit: 'cover' }} />
+                                        ) : (
+                                            <div style={{ width: '100%', height: '100%', borderRadius: '8px', backgroundColor: '#e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                                                    <path d="M4 16l4.586-4.586a2 2 0 0 1 2.828 0L16 16m-2-2l1.586-1.586a2 2 0 0 1 2.828 0L20 14m-6-6h.01M6 20h12a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2z" stroke="#94a3b8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                                                </svg>
+                                            </div>
+                                        )}
+                                        <input
+                                            type="file"
+                                            accept="image/*"
+                                            onChange={handleLogoUpload}
+                                            style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', opacity: 0, cursor: 'pointer' }}
+                                        />
+                                    </div>
+                                    <div style={{ flex: 1 }}>
+                                        <div style={{ fontSize: '11px', color: '#64748b' }}>Upload Logo</div>
+                                        {brandColor && (
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginTop: '4px' }}>
+                                                <div style={{ width: '12px', height: '12px', borderRadius: '50%', backgroundColor: `rgb(${brandColor.r}, ${brandColor.g}, ${brandColor.b})` }}></div>
+                                                <span style={{ fontSize: '10px', color: '#334155' }}>Color Detected</span>
+                                            </div>
+                                        )}
+                                    </div>
+                                    {brandLogo && (
+                                        <button 
+                                            onClick={() => { setBrandLogo(null); setBrandColor(null); }}
+                                            style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', fontSize: '16px' }}
+                                        >
+                                            ×
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+
                             <div style={styles.settingGroup}>
                                 <label style={styles.settingLabel}>Template</label>
                                 <div style={styles.templateGrid}>
@@ -1045,7 +1243,7 @@ addOnUISdk.ready.then(async () => {
                                                                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
                                                                     <polygon points="5,3 19,12 5,21" fill="white"/>
                                                                 </svg>
-                                                                Play Slideshow
+                                                                Play
                                                             </motion.button>
                                                         ) : (
                                                             <motion.button
@@ -1060,7 +1258,101 @@ addOnUISdk.ready.then(async () => {
                                                                 Stop
                                                             </motion.button>
                                                         )}
+                                                        
+                                                        <motion.button
+                                                            onClick={handleExportVideo}
+                                                            disabled={isVideoExporting}
+                                                            style={{
+                                                                ...styles.button,
+                                                                backgroundColor: "#f59e0b",
+                                                                color: "white",
+                                                                opacity: isVideoExporting ? 0.6 : 1,
+                                                                flex: 1,
+                                                                display: "flex",
+                                                                alignItems: "center",
+                                                                justifyContent: "center",
+                                                                gap: "6px",
+                                                                fontSize: "14px",
+                                                                fontWeight: 600
+                                                            }}
+                                                            whileHover={!isVideoExporting ? { scale: 1.02 } : {}}
+                                                            whileTap={!isVideoExporting ? { scale: 0.98 } : {}}
+                                                        >
+                                                            {isVideoExporting ? (
+                                                                "Exporting..."
+                                                            ) : (
+                                                                <>
+                                                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                                                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                                                        <polyline points="7 10 12 15 17 10"/>
+                                                                        <line x1="12" y1="15" x2="12" y2="3"/>
+                                                                    </svg>
+                                                                    Export
+                                                                </>
+                                                            )}
+                                                        </motion.button>
                                                     </div>
+                                                    
+                                                    {videoUrl && (
+                                                        <motion.div 
+                                                            initial={{ opacity: 0, y: 10 }}
+                                                            animate={{ opacity: 1, y: 0 }}
+                                                            style={{ marginTop: '12px', textAlign: 'center', padding: '10px', backgroundColor: '#ecfdf5', borderRadius: '8px', border: '1px solid #d1fae5' }}
+                                                        >
+                                                            <div style={{ fontSize: '12px', color: '#047857', marginBottom: '4px' }}>Video Ready!</div>
+                                                            <motion.button
+                                                                onClick={async () => {
+                                                                    try {
+                                                                        const filename = videoUrl.split('/').pop() || 'presentation.mp4';
+                                                                        const downloadUrl = `${API_BASE_URL}/api/download-video/${filename}`;
+                                                                        
+                                                                        // Fetch the video as blob
+                                                                        const response = await fetch(downloadUrl);
+                                                                        if (!response.ok) throw new Error('Download failed');
+                                                                        
+                                                                        const blob = await response.blob();
+                                                                        const url = window.URL.createObjectURL(blob);
+                                                                        
+                                                                        // Create temporary link and trigger download
+                                                                        const a = document.createElement('a');
+                                                                        a.href = url;
+                                                                        a.download = filename;
+                                                                        document.body.appendChild(a);
+                                                                        a.click();
+                                                                        
+                                                                        // Cleanup
+                                                                        window.URL.revokeObjectURL(url);
+                                                                        document.body.removeChild(a);
+                                                                    } catch (err) {
+                                                                        console.error('Download error:', err);
+                                                                        alert('Failed to download video. Please try again.');
+                                                                    }
+                                                                }}
+                                                                style={{ 
+                                                                    background: 'linear-gradient(135deg, #059669 0%, #047857 100%)',
+                                                                    color: 'white', 
+                                                                    border: 'none',
+                                                                    borderRadius: '8px',
+                                                                    padding: '10px 20px',
+                                                                    fontWeight: 600,
+                                                                    fontSize: '13px',
+                                                                    display: 'inline-flex',
+                                                                    alignItems: 'center',
+                                                                    gap: '6px',
+                                                                    cursor: 'pointer'
+                                                                }}
+                                                                whileHover={{ scale: 1.02 }}
+                                                                whileTap={{ scale: 0.98 }}
+                                                            >
+                                                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                                                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                                                    <polyline points="7 10 12 15 17 10"/>
+                                                                    <line x1="12" y1="15" x2="12" y2="3"/>
+                                                                </svg>
+                                                                Download MP4
+                                                            </motion.button>
+                                                        </motion.div>
+                                                    )}
                                                 </motion.div>
                                             )}
                                         </AnimatePresence>

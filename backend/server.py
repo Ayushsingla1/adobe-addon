@@ -9,12 +9,15 @@ import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 from typing import Optional, List
 from dotenv import load_dotenv
 
+import uuid
 from workflow import process_url
 from narration import generate_narrated_audio
+from video_gen import generate_video
 
 # Load environment variables
 load_dotenv()
@@ -30,6 +33,11 @@ app = FastAPI(
 audio_dir = os.path.join(os.path.dirname(__file__), "output", "audio")
 os.makedirs(audio_dir, exist_ok=True)
 app.mount("/audio", StaticFiles(directory=audio_dir), name="audio")
+
+# Serve generated video files
+video_dir = os.path.join(os.path.dirname(__file__), "output", "video")
+os.makedirs(video_dir, exist_ok=True)
+app.mount("/video", StaticFiles(directory=video_dir), name="video")
 
 # Configure CORS for Adobe Express add-on
 app.add_middleware(
@@ -99,6 +107,17 @@ class PresentationResponse(BaseModel):
     title: str
     slides: List[SlideData]
     error: Optional[str] = None
+
+
+class VideoExportRequest(BaseModel):
+    slides: List[SlideData]
+    slide_images: Optional[List[str]] = None  # Base64 encoded images from Adobe Express
+    audio_files: List[str]
+    template_settings: dict
+
+
+class VideoExportResponse(BaseModel):
+    video_url: str
 
 
 class HealthResponse(BaseModel):
@@ -218,6 +237,71 @@ async def generate_narration(request: NarrationRequest):
             status_code=500,
             detail=f"Failed to generate narration: {str(e)}"
         )
+
+
+@app.post("/api/export-video", response_model=VideoExportResponse)
+async def export_video(request: VideoExportRequest):
+    """
+    Generate an MP4 video from slides and audio.
+    """
+    try:
+        # Resolve audio paths
+        audio_paths = []
+        for filename in request.audio_files:
+            # Handle if full URL passed (e.g. /audio/file.mp3) or just filename
+            clean_name = filename.split('/')[-1]
+            path = os.path.join(audio_dir, clean_name)
+            if not os.path.exists(path):
+                raise HTTPException(status_code=404, detail=f"Audio file not found: {clean_name}")
+            audio_paths.append(path)
+            
+        video_output_dir = os.path.join(os.path.dirname(__file__), "output", "video")
+        os.makedirs(video_output_dir, exist_ok=True)
+        output_filename = f"presentation_{uuid.uuid4().hex[:8]}.mp4"
+        output_path = os.path.join(video_output_dir, output_filename)
+        
+        # Run video generation in a separate thread to avoid blocking event loop
+        # But for simplicity/demo, running synchronously (moviepy is CPU bound)
+        result_path = generate_video(
+            [s.dict() for s in request.slides],
+            audio_paths,
+            output_path,
+            template_settings=request.template_settings,
+            slide_images=request.slide_images  # Pass actual slide images if provided
+        )
+        
+        if not result_path:
+             raise HTTPException(status_code=500, detail="Video generation failed")
+             
+        return VideoExportResponse(video_url=f"/video/{output_filename}")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Video export failed: {str(e)}")
+
+
+@app.get("/api/download-video/{filename}")
+async def download_video(filename: str):
+    """
+    Download a generated video file with proper headers.
+    """
+    # Sanitize filename to prevent path traversal
+    safe_filename = os.path.basename(filename)
+    file_path = os.path.join(video_dir, safe_filename)
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    return FileResponse(
+        path=file_path,
+        filename=safe_filename,
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f"attachment; filename={safe_filename}",
+            "Access-Control-Expose-Headers": "Content-Disposition"
+        }
+    )
 
 
 @app.post("/api/detect-url-type")
