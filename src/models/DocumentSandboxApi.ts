@@ -48,6 +48,8 @@ export interface PresentationInput {
     slides: SlideData[];
     settings: PresentationSettings;
 }
+
+// Document Sandbox API interface
 export interface DocumentSandboxApi {
     generatePresentation(input: PresentationInput): Promise<void>;
 }

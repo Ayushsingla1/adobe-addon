@@ -80,10 +80,11 @@ def extract_youtube_content(state: WorkflowState) -> WorkflowState:
             return state
         
         # Get transcript
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        print(video_id)
+        ytt_api = YouTubeTranscriptApi()
+        transcript_list = ytt_api.fetch(video_id)
         
-        # Combine transcript segments into full text
-        full_transcript = " ".join([segment["text"] for segment in transcript_list])
+        full_transcript = " ".join([segment.text for segment in transcript_list.snippets])
         
         # Try to get video title from YouTube oEmbed API
         try:
