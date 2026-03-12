@@ -1,6 +1,6 @@
 # Adobe Essence - AI-Powered Presentation Generator
 
-Transform any URL (YouTube videos, blog posts, articles) into beautiful, narrated presentations with AI-powered content extraction and video export capabilities.
+Transform any URL (YouTube videos, blog posts, articles etc.) into beautiful, narrated presentations with AI-powered content extraction and video export capabilities.
 
 ## 🚀 Features
 
